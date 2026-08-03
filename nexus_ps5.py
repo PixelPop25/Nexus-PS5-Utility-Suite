@@ -843,20 +843,18 @@ class NexusApp(QMainWindow):
         
         lbl_brand = QLabel(APP_NAME)
         lbl_brand.setObjectName("Brand")
-        lbl_sub = QLabel(APP_SUBTITLE)
-        lbl_sub.setStyleSheet(f"color: {Theme.TEXT_DIM}; font-size: 9.5pt;")
         side_layout.addWidget(lbl_brand)
-        side_layout.addWidget(lbl_sub)
-        side_layout.addSpacing(8)
+        side_layout.addSpacing(2)
+        side_layout.addStretch()
         
         # Connection Box
         conn_box = QVBoxLayout()
-        conn_box.setSpacing(4)
+        conn_box.setSpacing(2)
         
         lbl_ip = QLabel("Console IP")
         lbl_ip.setStyleSheet(f"color: {Theme.TEXT_DIM}; font-size: 9pt;")
         self.ip_entry = QLineEdit(self.current_ip)
-        self.ip_entry.setPlaceholderText("192.168.1.X")
+        self.ip_entry.setPlaceholderText("192.168.1.1")
         self.ip_entry.textChanged.connect(self._autosave_conn)
         
         lbl_port = QLabel("Port")
@@ -875,8 +873,10 @@ class NexusApp(QMainWindow):
         conn_box.addWidget(self.port_entry)
         conn_box.addWidget(lbl_title)
         conn_box.addWidget(self.title_combo)
+        conn_box.addStretch()
         side_layout.addLayout(conn_box)
-        side_layout.addSpacing(6)
+        side_layout.addSpacing(3)
+
         
         # Connect / Disconnect Buttons
         btn_row = QHBoxLayout()
@@ -980,9 +980,9 @@ class NexusApp(QMainWindow):
         # Log Box
         log_frame = QFrame()
         log_frame.setObjectName("Card")
-        log_frame.setFixedHeight(130)
+        log_frame.setFixedHeight(200)
         log_layout = QVBoxLayout(log_frame)
-        log_layout.setContentsMargins(10, 8, 10, 8)
+        log_layout.setContentsMargins(5, 5, 5, 5)
         
         lbl_log = QLabel("⚡ Log")
         lbl_log.setStyleSheet(f"color: {Theme.ACCENT_RED}; font-weight: bold; font-size: 10.5pt;")
@@ -1146,7 +1146,7 @@ class NexusApp(QMainWindow):
         
         self.icon_lbl = QLabel("No Icon")
         self.icon_lbl.setObjectName("IconPreview")
-        self.icon_lbl.setFixedSize(170, 170)
+        self.icon_lbl.setFixedSize(170, 165)
         self.icon_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         cl.addWidget(self.icon_lbl)
         cl.addSpacing(16)
@@ -2766,7 +2766,7 @@ class NexusApp(QMainWindow):
             <head>
             <style>
                 body {{
-                    background: linear-gradient(135deg, {Theme.BG_DARK} 0%, #1a050a 50%, {Theme.BG_MID} 100%);
+                    background: linear-gradient(135deg, #111111 0%, #1a050a 50%, #1a1a1a 100%);
                     color: {Theme.TEXT};
                     font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
                     display: flex;
@@ -2794,15 +2794,15 @@ class NexusApp(QMainWindow):
                     max-width: 600px;
                 }}
                 .card {{
-                    background: {Theme.BG_CARD};
-                    border: 1px solid {Theme.SEPARATOR};
+                    background: #242424;
+                    border: 1px solid #333333;
                     border-radius: 8px;
                     padding: 20px;
                     text-align: center;
                     cursor: pointer;
                     transition: all 0.2s ease-in-out;
                     text-decoration: none;
-                    color: {Theme.TEXT};
+                    color: #f5f5f5;
                     font-weight: bold;
                 }}
                 .card:hover {{
@@ -2855,39 +2855,16 @@ class NexusApp(QMainWindow):
             self.web.load(QUrl(url))
 
 
-#  ENTRY POINT
-def _is_first_boot():
-    """True when no settings / history files exist yet."""
-    return not (os.path.exists(SETTINGS_FILE) or os.path.exists(TCP_HISTORY_FILE))
-
-
-def _show_first_boot_deps(parent=None):
-    """Friendly one-time prompt listing required packages."""
-    msg = (
-        "Welcome to NEXUS — PS5 Utility Suite!\n\n"
-        "This appears to be the first launch (no settings found).\n\n"
-        "Required dependencies:\n"
-        "  • PyQt6\n"
-        "  • PyQt6-WebEngine  (optional – for Console Browser)\n"
-        "  • mkpfs            (optional – for FFPFSC Creator)\n\n"
-        "Install with:\n"
-        "  pip install PyQt6 PyQt6-WebEngine\n\n"
-        "You can dismiss this message; it will not appear again once settings are saved."
-    )
-    CustomMessageBox.show_info(parent, "First Launch — Dependencies", msg)
 
 
 def main():
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     
-    first = _is_first_boot()
     
     window = NexusApp()
     window.show()
     
-    if first:
-        QTimer.singleShot(400, lambda: _show_first_boot_deps(window))
     
     sys.exit(app.exec())
 
