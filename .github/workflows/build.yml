@@ -1,0 +1,96 @@
+name: Build
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller PyQt6 PyQt6-WebEngine
+
+      - name: Build
+        run: |
+          pyinstaller --noconfirm --clean --windowed --onefile `
+            --name NEXUS `
+            --add-data "sounds;sounds" `
+            --hidden-import PyQt6.QtWebEngineWidgets `
+            nexus_ps5.py
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: NEXUS-windows
+          path: dist/NEXUS.exe
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller PyQt6 PyQt6-WebEngine
+
+      - name: Build
+        run: |
+          pyinstaller --noconfirm --clean --windowed --onedir \
+            --name NEXUS \
+            --add-data "sounds:sounds" \
+            --hidden-import PyQt6.QtWebEngineWidgets \
+            nexus_ps5.py
+          cd dist && zip -r NEXUS-macos.zip NEXUS.app NEXUS 2>/dev/null || zip -r NEXUS-macos.zip NEXUS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: NEXUS-macos
+          path: dist/NEXUS-macos.zip
+
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: System packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgl1 libxkbcommon0 libdbus-1-3 libxcb-cursor0
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller PyQt6 PyQt6-WebEngine
+
+      - name: Build
+        run: |
+          pyinstaller --noconfirm --clean --windowed --onedir \
+            --name NEXUS \
+            --add-data "sounds:sounds" \
+            --hidden-import PyQt6.QtWebEngineWidgets \
+            nexus_ps5.py
+          cd dist && tar -czf NEXUS-linux.tar.gz NEXUS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: NEXUS-linux
+          path: dist/NEXUS-linux.tar.gz
