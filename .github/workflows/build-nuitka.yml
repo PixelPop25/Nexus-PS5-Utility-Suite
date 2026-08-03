@@ -1,0 +1,141 @@
+name: Build (Nuitka)
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*-nuitka"
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install nuitka ordered-set zstandard PyQt6 PyQt6-WebEngine
+
+      - name: Build
+        run: |
+          python -m nuitka --standalone --onefile `
+            --enable-plugin=pyqt6 `
+            --windows-disable-console `
+            --windows-console-mode=disable `
+            --output-filename=NEXUS `
+            --include-data-dir=sounds=sounds `
+            --assume-yes-for-downloads `
+            nexus_ps5.py
+          if (Test-Path NEXUS.exe) { Move-Item -Force NEXUS.exe dist_nuitka\NEXUS.exe -ErrorAction SilentlyContinue }
+          New-Item -ItemType Directory -Force -Path dist_nuitka | Out-Null
+          Get-ChildItem -Filter NEXUS*.exe | ForEach-Object { Copy-Item $_.FullName dist_nuitka\NEXUS.exe -Force }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: NEXUS-windows-nuitka
+          path: |
+            dist_nuitka/NEXUS.exe
+            NEXUS.exe
+          if-no-files-found: warn
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install nuitka ordered-set zstandard PyQt6 PyQt6-WebEngine
+
+      - name: Build
+        run: |
+          python -m nuitka --standalone --onefile \
+            --enable-plugin=pyqt6 \
+            --macos-disable-console \
+            --output-filename=NEXUS \
+            --include-data-dir=sounds=sounds \
+            --assume-yes-for-downloads \
+            nexus_ps5.py
+          mkdir -p dist_nuitka
+          cp -f NEXUS.bin NEXUS dist_nuitka/NEXUS 2>/dev/null || true
+          (cd dist_nuitka && zip -r NEXUS-macos-nuitka.zip NEXUS) || zip -r dist_nuitka/NEXUS-macos-nuitka.zip NEXUS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: NEXUS-macos-nuitka
+          path: dist_nuitka/*.zip
+          if-no-files-found: warn
+
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: System packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ccache patchelf libgl1 libxkbcommon0 libdbus-1-3 libxcb-cursor0
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install nuitka ordered-set zstandard PyQt6 PyQt6-WebEngine
+
+      - name: Build
+        run: |
+          python -m nuitka --standalone --onefile \
+            --enable-plugin=pyqt6 \
+            --output-filename=NEXUS \
+            --include-data-dir=sounds=sounds \
+            --assume-yes-for-downloads \
+            nexus_ps5.py
+          mkdir -p dist_nuitka
+          cp -f NEXUS.bin NEXUS dist_nuitka/NEXUS 2>/dev/null || true
+          (cd dist_nuitka && tar -czf NEXUS-linux-nuitka.tar.gz NEXUS)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: NEXUS-linux-nuitka
+          path: dist_nuitka/*.tar.gz
+          if-no-files-found: warn
+
+  release:
+    needs: [windows, macos, linux]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Collect release files
+        run: |
+          mkdir -p release
+          find artifacts -type f \( -name '*.exe' -o -name '*.zip' -o -name '*.tar.gz' -o -name 'NEXUS' \) \
+            -exec cp -v {} release/ \;
+          ls -la release/ || true
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: release/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
