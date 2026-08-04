@@ -58,12 +58,13 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install nuitka ordered-set zstandard PyQt6 PyQt6-WebEngine
+          # Use PySide6 on macOS because Nuitka's PyQt6 plugin refuses to run on macOS
+          pip install nuitka ordered-set zstandard PySide6
 
       - name: Build
         run: |
           python -m nuitka --standalone --onefile \
-            --enable-plugin=pyqt6 \
+            --enable-plugin=pyside6 \
             --macos-disable-console \
             --output-filename=NEXUS \
             --include-data-dir=sounds=sounds \
