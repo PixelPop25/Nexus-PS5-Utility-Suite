@@ -18,6 +18,7 @@ import datetime
 import hashlib
 import queue as pyqueue
 import threading
+import posixpath
 from ftplib import FTP, error_perm
 
 try:
@@ -80,8 +81,8 @@ BROWSER_BOOKMARKS = [
     ("Garlic Saves", 8082, 105),
     ("CheatRunner", 9999, 100),
     ("BFPilot", 5905, 80),
-    ("PS5 Upload", 9113, 125),
-    ("Direct PKG Installerv2", 12800, 135),
+    ("PS5 Upload :9113", 9113, 125),
+    ("Direck Package Installerv2", 12800, 145),
 ]
 
 PAYLOAD_EXTS     = (".bin", ".elf")
@@ -475,6 +476,55 @@ def fmt_eta(seconds):
     if h > 0: return f"{h}h {m:02d}m"
     return f"{m:02d}:{s:02d}"
 
+def remote_join(*parts):
+    """Join FTP remote path segments with forward slashes (never backslashes)."""
+    cleaned = []
+    for p in parts:
+        if p is None:
+            continue
+        s = str(p).replace("\\", "/").strip("/")
+        if s:
+            cleaned.append(s)
+    if not cleaned:
+        return "/"
+    # Preserve absolute root if first original part was absolute-ish
+    result = "/" + "/".join(cleaned)
+    return result
+
+def is_valid_ip(ip):
+    """Basic IPv4 validation (does not resolve hostnames)."""
+    if not ip or not isinstance(ip, str):
+        return False
+    ip = ip.strip()
+    # Allow hostnames with at least one dot or known short names; prefer IPv4 check
+    parts = ip.split(".")
+    if len(parts) == 4 and all(p.isdigit() for p in parts):
+        try:
+            return all(0 <= int(p) <= 255 for p in parts)
+        except ValueError:
+            return False
+    # Hostname: letters, digits, dots, hyphens
+    if re.match(r"^[A-Za-z0-9][A-Za-z0-9.\-]*[A-Za-z0-9]$", ip) or re.match(r"^[A-Za-z0-9]+$", ip):
+        return True
+    return False
+
+def safe_ftp_close(ftp):
+    """Best-effort close of an FTP session (abort then close)."""
+    if ftp is None:
+        return
+    try:
+        ftp.abort()
+    except Exception:
+        pass
+    try:
+        ftp.close()
+    except Exception:
+        pass
+    try:
+        ftp.quit()
+    except Exception:
+        pass
+
 def ts_fmt(value):
     if not value: return ""
     try: return datetime.datetime.fromtimestamp(float(value)).strftime("%Y-%m-%d %H:%M:%S")
@@ -852,7 +902,12 @@ def ftp_list_detailed(ftp, path="."):
         pass
     lines = []
     try:
-        ftp.retrlines(f"LIST {path}", lines.append)
+        # Quote path when it contains spaces or special chars
+        list_arg = path
+        if path and path not in (".",) and any(c in path for c in " \t\"'"):
+            list_arg = f'"{path}"'
+        cmd = f"LIST {list_arg}" if path and path not in (".",) else "LIST"
+        ftp.retrlines(cmd, lines.append)
         for line in lines:
             parsed = parse_ftp_list_line(line)
             if parsed:
@@ -861,7 +916,8 @@ def ftp_list_detailed(ftp, path="."):
             return entries
     except Exception:
         pass
-    # nlst fallback
+    # nlst fallback — avoid per-name cwd probes (very slow on large dirs).
+    # Treat all names as files; size when available. User can Refresh after MLSD/LIST works.
     try:
         cwd = ftp.pwd()
         if path and path not in (".", cwd):
@@ -869,21 +925,21 @@ def ftp_list_detailed(ftp, path="."):
         for n in ftp.nlst():
             if n in (".", ".."):
                 continue
-            is_dir = False
-            try:
-                here = ftp.pwd()
-                ftp.cwd(n)
-                ftp.cwd(here)
-                is_dir = True
-            except Exception:
-                is_dir = False
+            base = posixpath.basename(n.rstrip("/"))
+            looks_dir = n.endswith("/")
             sz = 0
-            if not is_dir:
+            if not looks_dir:
                 try:
-                    sz = ftp.size(n) or 0
+                    sz = ftp.size(base) or 0
                 except Exception:
                     pass
-            entries.append({"name": n, "is_dir": is_dir, "size": sz, "perm": "", "mtime": ""})
+            entries.append({
+                "name": base,
+                "is_dir": looks_dir,
+                "size": sz,
+                "perm": "",
+                "mtime": "",
+            })
         if path and path not in (".", cwd):
             try:
                 ftp.cwd(cwd)
@@ -896,14 +952,14 @@ def ftp_list_detailed(ftp, path="."):
 def collect_local_transfer_jobs(paths, remote_base="/"):
     """Expand local files/folders into flat job list for upload."""
     jobs = []
-    remote_base = remote_base.rstrip("/") or ""
+    remote_base = (remote_base or "/").replace("\\", "/")
     for p in paths:
         if not p or not os.path.exists(p):
             continue
         if os.path.isfile(p):
             jobs.append({
                 "local": p,
-                "remote": f"{remote_base}/{os.path.basename(p)}" if remote_base else f"/{os.path.basename(p)}",
+                "remote": remote_join(remote_base, os.path.basename(p)),
                 "size": os.path.getsize(p),
                 "is_dir": False,
             })
@@ -912,13 +968,14 @@ def collect_local_transfer_jobs(paths, remote_base="/"):
             for root, dirs, files in os.walk(p):
                 rel_dir = os.path.relpath(root, p)
                 if rel_dir == ".":
-                    remote_dir = f"{remote_base}/{root_name}" if remote_base else f"/{root_name}"
+                    remote_dir = remote_join(remote_base, root_name)
                 else:
-                    remote_dir = f"{remote_base}/{root_name}/{rel_dir.replace(os.sep, '/')}" if remote_base else f"/{root_name}/{rel_dir.replace(os.sep, '/')}"
-                # ensure directory itself is created (empty marker job)
+                    remote_dir = remote_join(
+                        remote_base, root_name, rel_dir.replace(os.sep, "/")
+                    )
                 jobs.append({
                     "local": root,
-                    "remote": remote_dir.replace("\\", "/"),
+                    "remote": remote_dir,
                     "size": 0,
                     "is_dir": True,
                 })
@@ -930,7 +987,7 @@ def collect_local_transfer_jobs(paths, remote_base="/"):
                         sz = 0
                     jobs.append({
                         "local": full,
-                        "remote": f"{remote_dir}/{fn}".replace("\\", "/"),
+                        "remote": remote_join(remote_dir, fn),
                         "size": sz,
                         "is_dir": False,
                     })
@@ -1183,17 +1240,32 @@ class BaseTaskWorker(QThread):
         self.args = args
         self.kwargs = kwargs
         self.is_cancelled = False
+        self._active_ftp = None  # optional FTP the task can register for hard cancel
 
     def cancel(self):
         self.is_cancelled = True
+        ftp = self._active_ftp
+        if ftp is not None:
+            safe_ftp_close(ftp)
+
+    def set_active_ftp(self, ftp):
+        self._active_ftp = ftp
 
     def run(self):
         try:
             res = self.target_func(self.signals, self, *self.args, **self.kwargs)
-            self.signals.finished.emit(True, "OK", res)
+            if self.is_cancelled:
+                self.signals.finished.emit(False, "Cancelled", res)
+            else:
+                self.signals.finished.emit(True, "OK", res)
         except Exception as e:
-            self.signals.log.emit(f"[ERROR] {e}")
-            self.signals.finished.emit(False, str(e), None)
+            if self.is_cancelled or "cancelled" in str(e).lower():
+                self.signals.finished.emit(False, "Cancelled", None)
+            else:
+                self.signals.log.emit(f"[ERROR] {e}")
+                self.signals.finished.emit(False, str(e), None)
+        finally:
+            self._active_ftp = None
 
 
 class NexusApp(QMainWindow):
@@ -1214,9 +1286,10 @@ class NexusApp(QMainWindow):
         else:
             Theme.apply_dark()
         self.setStyleSheet(Theme.build_qss())
-        self.ftp = None
+        self.connected = False  # set only on main thread after successful connect
         self.ftp5 = None
         self.tcp_history = load_tcp_history()
+        self.tcp_cancel_flag = False
         
         self.current_ip = self.settings.get("last_ip", "")
         self.current_port = self.settings.get("last_port", "2121")
@@ -1234,11 +1307,15 @@ class NexusApp(QMainWindow):
         self.ftp5_cancel_flag = False
         self.ftp5_conn = None  # persistent FTP session for tab 5 keep-alive
         self.ftp5_conflict_policy = "ask"  # ask | overwrite | rename | skip
+        self._ftp5_live_ftps = []  # active transfer sockets for hard cancel
+        self._ftp5_live_ftps_lock = threading.Lock()
+        self._progress_emit_lock = threading.Lock()
+        self._last_progress_emit = 0.0
 
         # Tab-5 feature state
         self.ftp5_history = load_ftp5_history()
         self.ftp5_parallel_count = int(self.settings.get("ftp5_parallel_count", 4))
-        self.ftp5_verify_checksum = False
+        self.ftp5_verify_checksum = bool(self.settings.get("ftp5_verify_checksum", False))
         self.ftp5_paused = False
         self.ftp5_queue_items = []
         self._ftp5_active_workers = []
@@ -1436,7 +1513,7 @@ class NexusApp(QMainWindow):
             ("TCP Sender",      "🔌", self._build_tab_tcp),
             ("FTP Manager",     "📁", self._build_tab_ftp),
             ("FFPFSC Creator",  "💿", self._build_tab_ffpfsc),
-            ("Web Apps", "🌐", self._build_tab_browser)
+            ("Console Browser", "🌐", self._build_tab_browser)
         ]
 
         for i, (name, icon, builder) in enumerate(tab_defs):
@@ -1748,7 +1825,7 @@ class NexusApp(QMainWindow):
             self._ftp5_active_workers = [w for w in self._ftp5_active_workers if w.isRunning()]
 
     def _is_connected(self):
-        if self.ftp is not None:
+        if getattr(self, "connected", False):
             return True
         if getattr(self, "ftp5_conn", None) is not None:
             return True
@@ -1759,6 +1836,9 @@ class NexusApp(QMainWindow):
         ip = (self.ip_entry.text().strip() if hasattr(self, "ip_entry") else "") or self.current_ip
         if not ip:
             CustomMessageBox.show_info(self, "Error", "Enter console IP first.")
+            return None
+        if not is_valid_ip(ip):
+            CustomMessageBox.show_info(self, "Error", f"Invalid IP / hostname: {ip}")
             return None
         port = (self.port_entry.text().strip() if hasattr(self, "port_entry") else "") or self.current_port or "2121"
         self.current_ip = ip
@@ -1775,26 +1855,32 @@ class NexusApp(QMainWindow):
     def _on_connect(self):
         self.play_sound()
         ip = self.ip_entry.text().strip()
-        try: port = int(self.port_entry.text().strip())
+        try:
+            port = int(self.port_entry.text().strip())
         except ValueError:
             CustomMessageBox.show_info(self, "Error", "Port must be a valid integer.")
             return
-            
+
         if not ip:
             CustomMessageBox.show_info(self, "Error", "Enter console IP first.")
             return
-            
+        if not is_valid_ip(ip):
+            CustomMessageBox.show_info(self, "Error", f"Invalid IP / hostname: {ip}")
+            return
+
         self.btn_connect.setEnabled(False)
         self.log(f"Connecting to {ip}:{port} ...")
-        
+
         def _connect_task(signals, worker):
-            if self.ftp:
-                try: self.ftp.quit()
-                except: pass
+            # Probe only — never assign UI/state from the worker thread.
             ftp = FTP()
-            ftp.connect(ip, port, timeout=10)
-            ftp.login()
-            self.ftp = ftp
+            worker.set_active_ftp(ftp)
+            try:
+                ftp.connect(ip, port, timeout=10)
+                ftp.login()
+            finally:
+                safe_ftp_close(ftp)
+                worker.set_active_ftp(None)
             return "Connected"
 
         worker = BaseTaskWorker(_connect_task)
@@ -1806,6 +1892,8 @@ class NexusApp(QMainWindow):
     def _on_connect_finished(self, success, msg, res):
         self.btn_connect.setEnabled(True)
         if success:
+            # All state mutation happens on the main thread.
+            self.connected = True
             self.glow.set_connected(True)
             self.conn_label.setText("Connected")
             self.conn_label.setStyleSheet(f"color: {Theme.GREEN}; font-weight: bold;")
@@ -1821,6 +1909,7 @@ class NexusApp(QMainWindow):
             except Exception as e:
                 self.log(f"[FTP] Tab session setup: {e}")
         else:
+            self.connected = False
             self.glow.set_connected(False)
             self.conn_label.setText("Disconnected")
             self.conn_label.setStyleSheet(f"color: {Theme.RED_GLOW}; font-weight: bold;")
@@ -1828,18 +1917,20 @@ class NexusApp(QMainWindow):
 
     def _on_disconnect(self):
         self.play_sound()
-        if self.ftp:
-            try: self.ftp.quit()
-            except: pass
-            self.ftp = None
-        if getattr(self, "ftp5_conn", None) is not None:
+        self.connected = False
+        self.ftp5_cancel_flag = True
+        # Hard-close any in-flight transfer sockets
+        with getattr(self, "_ftp5_live_ftps_lock", threading.Lock()):
+            for ftp in list(getattr(self, "_ftp5_live_ftps", [])):
+                safe_ftp_close(ftp)
+            self._ftp5_live_ftps = []
+        for w in list(getattr(self, "_ftp5_active_workers", [])):
             try:
-                self.ftp5_conn.quit()
+                w.cancel()
             except Exception:
-                try:
-                    self.ftp5_conn.close()
-                except Exception:
-                    pass
+                pass
+        if getattr(self, "ftp5_conn", None) is not None:
+            safe_ftp_close(self.ftp5_conn)
             self.ftp5_conn = None
         if hasattr(self, "ftp5_keepalive_timer"):
             self.ftp5_keepalive_timer.stop()
@@ -1955,8 +2046,10 @@ class NexusApp(QMainWindow):
                 self.icon_lbl.setPixmap(pixmap.scaled(160, 160, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
             self.yt_prog.set_progress(100)
             self.log("[ICON] Icon retrieved successfully.")
-            try: os.remove(tmp_file)
-            except: pass
+            try:
+                os.remove(tmp_file)
+            except Exception:
+                pass
         else:
             self.yt_prog.set_progress(0)
             CustomMessageBox.show_info(self, "Retrieve Failed", msg)
@@ -2435,16 +2528,22 @@ class NexusApp(QMainWindow):
         
         def _task(signals, worker):
             ftp = FTP()
-            ftp.connect(ip, int(port), timeout=10)
-            ftp.login()
-            try: ftp.cwd(target_dir)
-            except: ftp.mkd(target_dir)
-            
-            rpath = f"{target_dir}/{os.path.basename(fp)}"
-            with open(fp, "rb") as f: ftp.storbinary(f"STOR {rpath}", f)
-            ftp.quit()
+            worker.set_active_ftp(ftp)
+            try:
+                ftp.connect(ip, int(port), timeout=10)
+                ftp.login()
+                try:
+                    ftp.cwd(target_dir)
+                except Exception:
+                    ftp.mkd(target_dir)
+                rpath = remote_join(target_dir, os.path.basename(fp))
+                with open(fp, "rb") as f:
+                    ftp.storbinary(f"STOR {rpath}", f)
+            finally:
+                safe_ftp_close(ftp)
+                worker.set_active_ftp(None)
             return True
-            
+
         worker = BaseTaskWorker(_task)
         worker.signals.log.connect(self.log)
         worker.signals.finished.connect(lambda s, m, r: self.auto_prog.set_progress(100 if s else 0))
@@ -2458,23 +2557,29 @@ class NexusApp(QMainWindow):
             return
         ip, port = conn
         target_dir = self._get_target_autoload_dir()
-        target_file = f"{target_dir}/autoload.txt"
+        target_file = remote_join(target_dir, "autoload.txt")
         payload_text = build_autoload_text(self.autoload_blocks)
-        
+
         self.auto_prog.set_progress(0)
-        
+
         def _task(signals, worker):
             ftp = FTP()
-            ftp.connect(ip, int(port), timeout=10)
-            ftp.login()
-            try: ftp.cwd(target_dir)
-            except: ftp.mkd(target_dir)
-            
-            tmp = os.path.join(tempfile.gettempdir(), "autoload_out.txt")
-            with open(tmp, "w", encoding="utf-8") as f: f.write(payload_text)
-            
-            with open(tmp, "rb") as f: ftp.storbinary(f"STOR {target_file}", f)
-            ftp.quit()
+            worker.set_active_ftp(ftp)
+            try:
+                ftp.connect(ip, int(port), timeout=10)
+                ftp.login()
+                try:
+                    ftp.cwd(target_dir)
+                except Exception:
+                    ftp.mkd(target_dir)
+                tmp = os.path.join(tempfile.gettempdir(), "autoload_out.txt")
+                with open(tmp, "w", encoding="utf-8") as f:
+                    f.write(payload_text)
+                with open(tmp, "rb") as f:
+                    ftp.storbinary(f"STOR {target_file}", f)
+            finally:
+                safe_ftp_close(ftp)
+                worker.set_active_ftp(None)
             return True
 
         worker = BaseTaskWorker(_task)
@@ -2643,9 +2748,12 @@ class NexusApp(QMainWindow):
             names = ftp.nlst()
             items = []
             for n in names:
-                if n in (".", ".."): continue
-                try: sz = ftp.size(n) or 0
-                except: sz = 0
+                if n in (".", ".."):
+                    continue
+                try:
+                    sz = ftp.size(n) or 0
+                except Exception:
+                    sz = 0
                 items.append(ensure_uid({"name": n, "path": n, "size": sz, "enabled": True, "remote": True}))
             ftp.quit()
             return items
@@ -2687,17 +2795,26 @@ class NexusApp(QMainWindow):
         
         def _task(signals, worker):
             ftp = FTP()
-            ftp.connect(ip, int(port), timeout=10)
-            ftp.login()
-            try: ftp.cwd(remote_dir)
-            except: pass
-            total = len(selected)
-            for i, item in enumerate(selected, 1):
-                rpath = f"{remote_dir}{os.path.basename(item['path'])}"
-                signals.log.emit(f"[Y2JB] Uploading {os.path.basename(item['path'])} ...")
-                with open(item['path'], "rb") as f: ftp.storbinary(f"STOR {rpath}", f)
-                signals.progress.emit(i/total*100, 0, -1, os.path.basename(item['path']))
-            ftp.quit()
+            worker.set_active_ftp(ftp)
+            try:
+                ftp.connect(ip, int(port), timeout=10)
+                ftp.login()
+                try:
+                    ftp.cwd(remote_dir)
+                except Exception:
+                    pass
+                total = len(selected)
+                for i, item in enumerate(selected, 1):
+                    if worker.is_cancelled:
+                        raise IOError("cancelled")
+                    rpath = f"{remote_dir}{os.path.basename(item['path'])}"
+                    signals.log.emit(f"[Y2JB] Uploading {os.path.basename(item['path'])} ...")
+                    with open(item["path"], "rb") as f:
+                        ftp.storbinary(f"STOR {rpath}", f)
+                    signals.progress.emit(i / total * 100, 0, -1, os.path.basename(item["path"]))
+            finally:
+                safe_ftp_close(ftp)
+                worker.set_active_ftp(None)
             return True
 
         worker = BaseTaskWorker(_task)
@@ -2747,27 +2864,36 @@ class NexusApp(QMainWindow):
             return
         ip, port = conn
         sel = self.y2jb_tree.selectedItems()
-        if not sel or len(sel) > 1: return
+        if not sel or len(sel) > 1:
+            return
         uid = sel[0].data(0, Qt.ItemDataRole.UserRole)
         target = next((it for it in self.y2jb_items if it["uid"] == uid and it.get("remote")), None)
-        if not target: return
-        
+        if not target:
+            return
+
         old_name = target["name"]
-        new_name, ok = QFileDialog.getSaveFileName(self, "Rename Remote File", old_name)
-        if not ok or not new_name: return
-        new_name = os.path.basename(new_name).strip()
-        
+        new_name, ok = QInputDialog.getText(self, "Rename Remote File", "New name:", text=old_name)
+        if not ok or not new_name.strip() or new_name.strip() == old_name:
+            return
+        new_name = new_name.strip()
+        if "/" in new_name or "\\" in new_name:
+            CustomMessageBox.show_info(self, "Rename", "Name must not contain path separators.")
+            return
+
         title_id = self.get_title_id()
         sb_idx = self.y2jb_sb_combo.currentText()
         remote_dir = REMOTE_SANDBOX_TEMPLATE.format(title_id=title_id, sandbox_idx=sb_idx)
-        ip, port = self.current_ip, self.current_port
-        
+
         def _task(signals, worker):
             ftp = FTP()
-            ftp.connect(ip, int(port), timeout=10)
-            ftp.login()
-            ftp.rename(f"{remote_dir}{old_name}", f"{remote_dir}{new_name}")
-            ftp.quit()
+            worker.set_active_ftp(ftp)
+            try:
+                ftp.connect(ip, int(port), timeout=10)
+                ftp.login()
+                ftp.rename(f"{remote_dir}{old_name}", f"{remote_dir}{new_name}")
+            finally:
+                safe_ftp_close(ftp)
+                worker.set_active_ftp(None)
             return True
 
         worker = BaseTaskWorker(_task)
@@ -2909,15 +3035,17 @@ class NexusApp(QMainWindow):
         if not path or not os.path.exists(path):
             CustomMessageBox.show_info(self, "Error", "Select an existing file or folder first.")
             return
+        source_path = path
         if os.path.isfile(path):
             files = [path]
         else:
             files = [e["path"] for e in collect_folder_entries(path)]
-        self._tcp_send_files_task(files)
+        self._tcp_send_files_task(files, source_path=source_path)
 
     def _tcp_send_selected(self):
         sel = self.tcp_tree.selectedItems()
-        if not sel: return
+        if not sel:
+            return
         files = []
         for item in sel:
             uid = item.data(0, Qt.ItemDataRole.UserRole)
@@ -2925,52 +3053,150 @@ class NexusApp(QMainWindow):
             if hist_item:
                 if hist_item.get("kind") == "folder":
                     for c in hist_item.get("children", []):
-                        if os.path.exists(c.get("path", "")): files.append(c["path"])
+                        if os.path.exists(c.get("path", "")):
+                            files.append(c["path"])
                 else:
-                    if os.path.exists(hist_item.get("path", "")): files.append(hist_item["path"])
+                    if os.path.exists(hist_item.get("path", "")):
+                        files.append(hist_item["path"])
         if files:
-            self._tcp_send_files_task(files)
+            self._tcp_send_files_task(files, source_path=None)
 
-    def _tcp_send_files_task(self, files):
+    def _tcp_record_history(self, files, source_path=None):
+        """Record successfully sent files/folders into TCP history."""
+        now = time.time()
+        if source_path and os.path.isdir(source_path):
+            children = []
+            total = 0
+            for fpath in files:
+                try:
+                    sz = os.path.getsize(fpath)
+                except Exception:
+                    sz = 0
+                total += sz
+                children.append(ensure_uid({
+                    "name": os.path.basename(fpath),
+                    "path": fpath,
+                    "size": sz,
+                    "kind": "file",
+                    "last_used": now,
+                }))
+            entry = ensure_uid({
+                "name": os.path.basename(source_path.rstrip("\\/")) or source_path,
+                "path": source_path,
+                "size": total,
+                "kind": "folder",
+                "last_used": now,
+                "children": children,
+            })
+            self.tcp_history = [h for h in self.tcp_history if h.get("path") != source_path]
+            self.tcp_history.append(entry)
+        else:
+            for fpath in files:
+                if not os.path.isfile(fpath):
+                    continue
+                try:
+                    sz = os.path.getsize(fpath)
+                except Exception:
+                    sz = 0
+                existing = next(
+                    (h for h in self.tcp_history if h.get("path") == fpath and h.get("kind") != "folder"),
+                    None,
+                )
+                if existing:
+                    existing["last_used"] = now
+                    existing["size"] = sz
+                    existing["name"] = os.path.basename(fpath)
+                else:
+                    self.tcp_history.append(ensure_uid({
+                        "name": os.path.basename(fpath),
+                        "path": fpath,
+                        "size": sz,
+                        "kind": "file",
+                        "last_used": now,
+                    }))
+        self.tcp_history = self.tcp_history[-20:]
+        save_tcp_history(self.tcp_history)
+        self._load_tcp_history_tree()
+
+    def _tcp_send_files_task(self, files, source_path=None):
         conn = self._require_ip(need_connected=False)
         if not conn:
             return
         ip, port = conn
-            
+        files = [f for f in files if f and os.path.exists(f)]
+        if not files:
+            CustomMessageBox.show_info(self, "Error", "No readable files to send.")
+            return
+
+        self.tcp_cancel_flag = False
         self.tcp_prog.set_progress(0)
-        total_size = sum(os.path.getsize(f) for f in files if os.path.exists(f))
-        
+        total_size = sum(os.path.getsize(f) for f in files if os.path.exists(f)) or 1
+        last_emit = [0.0]
+
         def _task(signals, worker):
             sent_bytes = 0
             start_time = time.time()
-            with socket.create_connection((ip, int(port)), timeout=10) as sock:
+            sock = socket.create_connection((ip, int(port)), timeout=10)
+            try:
                 for fpath in files:
+                    if worker.is_cancelled or self.tcp_cancel_flag:
+                        raise IOError("cancelled")
                     signals.log.emit(f"[TCP] Sending {os.path.basename(fpath)} ...")
                     with open(fpath, "rb") as fh:
                         while True:
-                            chunk = fh.read(1024*1024)
-                            if not chunk: break
+                            if worker.is_cancelled or self.tcp_cancel_flag:
+                                raise IOError("cancelled")
+                            chunk = fh.read(1024 * 1024)
+                            if not chunk:
+                                break
                             sock.sendall(chunk)
                             sent_bytes += len(chunk)
-                            el = time.time() - start_time
-                            spd = sent_bytes / max(0.001, el)
-                            eta = (total_size - sent_bytes) / max(1, spd)
-                            signals.progress.emit(sent_bytes/max(1, total_size)*100, spd, eta, os.path.basename(fpath))
+                            now = time.time()
+                            if now - last_emit[0] >= 0.08 or sent_bytes >= total_size:
+                                last_emit[0] = now
+                                el = now - start_time
+                                spd = sent_bytes / max(0.001, el)
+                                eta = (total_size - sent_bytes) / max(1, spd)
+                                signals.progress.emit(
+                                    sent_bytes / total_size * 100, spd, eta, os.path.basename(fpath)
+                                )
+            finally:
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except Exception:
+                    pass
+                try:
+                    sock.close()
+                except Exception:
+                    pass
             return True
+
+        def _on_finished(success, msg, res):
+            if success:
+                self.tcp_prog.set_progress(100)
+                try:
+                    self._tcp_record_history(files, source_path=source_path)
+                except Exception as e:
+                    self.log(f"[TCP] History update failed: {e}")
+                CustomMessageBox.show_info(self, "Success", f"Sent {len(files)} file(s).")
+            elif msg == "Cancelled" or "cancel" in str(msg).lower():
+                self.tcp_prog.set_progress(0)
+                self.log("[TCP] Send cancelled.")
+            else:
+                self.tcp_prog.set_progress(0)
+                CustomMessageBox.show_info(self, "TCP Error", msg)
 
         worker = BaseTaskWorker(_task)
         worker.signals.log.connect(self.log)
         worker.signals.progress.connect(lambda v, s, e, l: self.tcp_prog.set_progress(v, s, e, l))
-        worker.signals.finished.connect(
-            lambda s, m, r: CustomMessageBox.show_info(self, "Success", f"Sent {len(files)} file(s).")
-            if s else CustomMessageBox.show_info(self, "TCP Error", m)
-        )
+        worker.signals.finished.connect(_on_finished)
         worker.start()
         self._track_worker(worker)
 
     def _tcp_remove_history(self):
         sel = self.tcp_tree.selectedItems()
-        if not sel: return
+        if not sel:
+            return
         uids = {item.data(0, Qt.ItemDataRole.UserRole) for item in sel}
         self.tcp_history = [h for h in self.tcp_history if h["uid"] not in uids]
         save_tcp_history(self.tcp_history)
@@ -3624,6 +3850,16 @@ class NexusApp(QMainWindow):
     def _ftp5_cancel_transfer(self):
         self.ftp5_cancel_flag = True
         self.log("[FTP] Cancelling ongoing transfer...")
+        # Hard-close active transfer sockets so blocked retrbinary/storbinary abort.
+        with self._ftp5_live_ftps_lock:
+            for ftp in list(self._ftp5_live_ftps):
+                safe_ftp_close(ftp)
+            self._ftp5_live_ftps.clear()
+        for w in list(self._ftp5_active_workers):
+            try:
+                w.cancel()
+            except Exception:
+                pass
 
 
 
@@ -3707,40 +3943,38 @@ class NexusApp(QMainWindow):
         except Exception:
             return None
 
+    def _ftp5_mkdir_dirs_worker(self, signals, worker, dir_jobs, ip, port):
+        """Create remote directories off the UI thread."""
+        ftp = FTP()
+        worker.set_active_ftp(ftp)
+        with self._ftp5_live_ftps_lock:
+            self._ftp5_live_ftps.append(ftp)
+        try:
+            ftp.connect(ip, int(port), timeout=15)
+            ftp.login()
+            for dj in dir_jobs:
+                if worker.is_cancelled or self.ftp5_cancel_flag:
+                    raise IOError("cancelled")
+                parts = [p for p in str(dj["remote"]).strip("/").split("/") if p]
+                cur = ""
+                for part in parts:
+                    cur = f"{cur}/{part}"
+                    try:
+                        ftp.mkd(cur)
+                    except Exception:
+                        pass
+        finally:
+            with self._ftp5_live_ftps_lock:
+                if ftp in self._ftp5_live_ftps:
+                    self._ftp5_live_ftps.remove(ftp)
+            safe_ftp_close(ftp)
+            worker.set_active_ftp(None)
+        return True
+
     def _ftp5_launch_parallel(self, direction, file_jobs, fixed_policy, ip, port, dir_jobs=None):
         if not file_jobs and not dir_jobs:
             return
         dir_jobs = dir_jobs or []
-
-        if direction == "upload" and dir_jobs:
-            try:
-                try:
-                    ftp = self._ftp5_open_session(ip, port)
-                    own = False
-                except Exception:
-                    ftp = FTP()
-                    ftp.connect(ip, int(port), timeout=15)
-                    ftp.login()
-                    own = True
-                for dj in dir_jobs:
-                    parts = [p for p in dj["remote"].strip("/").split("/") if p]
-                    cur = ""
-                    for part in parts:
-                        cur = f"{cur}/{part}"
-                        try:
-                            ftp.mkd(cur)
-                        except Exception:
-                            pass
-                if own:
-                    try:
-                        ftp.quit()
-                    except Exception:
-                        pass
-            except Exception as e:
-                self.log(f"[ERROR] mkdir pass failed: {e}")
-        elif direction == "download" and dir_jobs:
-            for dj in dir_jobs:
-                os.makedirs(dj["local"], exist_ok=True)
 
         total_bytes = sum(j["size"] for j in file_jobs) or 1
         self.ftp5_cancel_flag = False
@@ -3752,138 +3986,208 @@ class NexusApp(QMainWindow):
 
         self._ftp5_queue_item_map = self._ftp5_populate_queue(direction, file_jobs)
 
-        n_workers = max(1, min(self.ftp5_parallel_count, len(file_jobs))) if file_jobs else 0
-        self.log(f"[FTP] {direction.capitalize()} queue: {len(file_jobs)} file(s), "
-                 f"{fmt_bytes(total_bytes)}, {n_workers} connection(s)")
+        # Local download dirs are cheap — do on main thread.
+        if direction == "download" and dir_jobs:
+            for dj in dir_jobs:
+                try:
+                    os.makedirs(dj["local"], exist_ok=True)
+                except Exception as e:
+                    self.log(f"[ERROR] local mkdir {dj['local']}: {e}")
 
-        chunks = [file_jobs[i::n_workers] for i in range(n_workers)] if n_workers else []
-
-        shared = {
-            "lock": threading.Lock(),
-            "sent": 0,
-            "start": time.time(),
-            "total": total_bytes,
-            "completed": 0,
-            "worker_count": len(chunks),
-            "history": [],
-            "any_fail": False,
-        }
-
-        if not chunks:
-            self._ftp5_finish_parallel_transfer(shared, direction)
-            return
-
-        for chunk in chunks:
-            worker = BaseTaskWorker(self._ftp5_chunk_task, direction, chunk, fixed_policy, ip, port, shared)
-            worker.signals.log.connect(self.log)
-            worker.signals.item_update.connect(self._ftp5_on_queue_item_update)
-            worker.signals.progress.connect(lambda v, s, e, l: self.ftp5_prog.set_progress(v, s, e, l))
-            worker.signals.finished.connect(
-                lambda ok, msg, res, shared=shared, direction=direction:
-                    self._ftp5_on_chunk_finished(ok, msg, res, shared, direction)
+        def _start_file_workers():
+            n_workers = max(1, min(self.ftp5_parallel_count, len(file_jobs))) if file_jobs else 0
+            self.log(
+                f"[FTP] {direction.capitalize()} queue: {len(file_jobs)} file(s), "
+                f"{fmt_bytes(total_bytes)}, {n_workers} connection(s)"
             )
-            worker.start()
-            self._ftp5_active_workers.append(worker)
-            self._track_worker(worker)
+            chunks = [file_jobs[i::n_workers] for i in range(n_workers)] if n_workers else []
+            shared = {
+                "lock": threading.Lock(),
+                "sent": 0,
+                "start": time.time(),
+                "total": total_bytes,
+                "completed": 0,
+                "worker_count": len(chunks),
+                "history": [],
+                "any_fail": False,
+                "last_progress_emit": 0.0,
+            }
+            if not chunks:
+                self._ftp5_finish_parallel_transfer(shared, direction)
+                return
+            for chunk in chunks:
+                worker = BaseTaskWorker(
+                    self._ftp5_chunk_task, direction, chunk, fixed_policy, ip, port, shared
+                )
+                worker.signals.log.connect(self.log)
+                worker.signals.item_update.connect(self._ftp5_on_queue_item_update)
+                worker.signals.progress.connect(
+                    lambda v, s, e, l: self.ftp5_prog.set_progress(v, s, e, l)
+                )
+                worker.signals.finished.connect(
+                    lambda ok, msg, res, shared=shared, direction=direction:
+                        self._ftp5_on_chunk_finished(ok, msg, res, shared, direction)
+                )
+                worker.start()
+                self._ftp5_active_workers.append(worker)
+                self._track_worker(worker)
+
+        # Remote mkdir for upload: off UI thread, then start file workers.
+        if direction == "upload" and dir_jobs:
+            self.log(f"[FTP] Creating {len(dir_jobs)} remote director(ies) ...")
+
+            def _on_mkdir_done(ok, msg, res):
+                if self.ftp5_cancel_flag:
+                    self._ftp5_finish_parallel_transfer(
+                        {
+                            "lock": threading.Lock(),
+                            "sent": 0,
+                            "start": time.time(),
+                            "total": 1,
+                            "completed": 0,
+                            "worker_count": 0,
+                            "history": [],
+                            "any_fail": False,
+                        },
+                        direction,
+                    )
+                    return
+                if not ok:
+                    self.log(f"[ERROR] mkdir pass failed: {msg}")
+                _start_file_workers()
+
+            mw = BaseTaskWorker(self._ftp5_mkdir_dirs_worker, dir_jobs, ip, port)
+            mw.signals.log.connect(self.log)
+            mw.signals.finished.connect(_on_mkdir_done)
+            mw.start()
+            self._ftp5_active_workers.append(mw)
+            self._track_worker(mw)
+        else:
+            _start_file_workers()
 
     def _ftp5_chunk_task(self, signals, worker, direction, chunk, fixed_policy, ip, port, shared):
         ftp = FTP()
-        ftp.connect(ip, int(port), timeout=15)
-        ftp.login()
-        for job in chunk:
-            if self.ftp5_cancel_flag:
-                break
-            while self.ftp5_paused and not self.ftp5_cancel_flag:
-                time.sleep(0.2)
-            rpath = job["remote"]
-            lpath = job["local"]
-            fn = os.path.basename(lpath)
-            key = self._ftp5_job_key(direction, rpath)
-            signals.item_update.emit(key, "Active")
-
-            # conflict check
-            exists = os.path.exists(lpath) if direction == "download" else False
-            if direction == "upload":
-                try:
-                    ftp.size(rpath)
-                    exists = True
-                except Exception:
-                    exists = False
-            if exists:
-                decision = fixed_policy or "skip"
-                if decision == "skip":
-                    signals.log.emit(f"[FTP] Skip existing {fn}")
-                    signals.item_update.emit(key, "Skipped")
-                    with shared["lock"]:
-                        shared["sent"] += job["size"]
-                        shared["history"].append(self._ftp5_history_row(direction, fn, "Skipped", job["size"]))
-                    continue
-                elif decision == "rename":
-                    if direction == "upload":
-                        stem, ext = os.path.splitext(rpath)
-                        rpath = f"{stem}_copy{ext}"
-                    else:
-                        stem, ext = os.path.splitext(lpath)
-                        lpath = f"{stem}_copy{ext}"
-
-            def _cb(nbytes):
-                if self.ftp5_cancel_flag:
-                    raise IOError("cancelled")
-                with shared["lock"]:
-                    shared["sent"] += nbytes
-                    sent = shared["sent"]
-                el = time.time() - shared["start"]
-                spd = sent / max(0.001, el)
-                eta = (shared["total"] - sent) / max(1, spd)
-                pct = min(100.0, sent / shared["total"] * 100.0)
-                signals.progress.emit(pct, spd, eta, fn)
-
-            status = "Done"
-            try:
-                if direction == "upload":
-                    signals.log.emit(f"[FTP] Uploading {fn} → {rpath}")
-                    with open(lpath, "rb") as f:
-                        ftp.storbinary(f"STOR {rpath}", f, blocksize=1024 * 512,
-                                        callback=lambda data: _cb(len(data)))
-                else:
-                    signals.log.emit(f"[FTP] Downloading {fn}")
-                    os.makedirs(os.path.dirname(lpath) or ".", exist_ok=True)
-                    with open(lpath, "wb") as f:
-                        def writer(data, _f=f):
-                            _f.write(data)
-                            _cb(len(data))
-                        try:
-                            ftp.retrbinary(f"RETR {rpath}", writer, blocksize=1024 * 512)
-                        except Exception:
-                            ftp.cwd(os.path.dirname(rpath) or "/")
-                            ftp.retrbinary(f"RETR {os.path.basename(rpath)}", writer, blocksize=1024 * 512)
-
-                checksum = None
-                if self.ftp5_verify_checksum:
-                    hash_target = lpath if direction == "upload" else lpath
-                    checksum = self._ftp5_file_md5(hash_target)
-                    if checksum:
-                        signals.log.emit(f"[FTP] MD5 {fn}: {checksum}")
-            except Exception as e:
-                if "cancelled" in str(e).lower():
-                    signals.log.emit("[FTP] Transfer cancelled.")
-                    signals.item_update.emit(key, "Cancelled")
-                    break
-                signals.log.emit(f"[ERROR] {fn}: {e}")
-                status = "Failed"
-                with shared["lock"]:
-                    shared["any_fail"] = True
-                checksum = None
-
-            signals.item_update.emit(key, status)
-            with shared["lock"]:
-                shared["history"].append(
-                    self._ftp5_history_row(direction, fn, status, job["size"], checksum=checksum,
-                                            local=lpath, remote=rpath))
+        worker.set_active_ftp(ftp)
+        with self._ftp5_live_ftps_lock:
+            self._ftp5_live_ftps.append(ftp)
         try:
-            ftp.quit()
-        except Exception:
-            pass
+            ftp.connect(ip, int(port), timeout=15)
+            ftp.login()
+            for job in chunk:
+                if self.ftp5_cancel_flag or worker.is_cancelled:
+                    break
+                while self.ftp5_paused and not self.ftp5_cancel_flag and not worker.is_cancelled:
+                    time.sleep(0.2)
+                if self.ftp5_cancel_flag or worker.is_cancelled:
+                    break
+                rpath = job["remote"]
+                lpath = job["local"]
+                fn = os.path.basename(lpath)
+                key = self._ftp5_job_key(direction, rpath)
+                signals.item_update.emit(key, "Active")
+
+                exists = os.path.exists(lpath) if direction == "download" else False
+                if direction == "upload":
+                    try:
+                        ftp.size(rpath)
+                        exists = True
+                    except Exception:
+                        exists = False
+                if exists:
+                    decision = fixed_policy or "skip"
+                    if decision == "skip":
+                        signals.log.emit(f"[FTP] Skip existing {fn}")
+                        signals.item_update.emit(key, "Skipped")
+                        with shared["lock"]:
+                            shared["sent"] += job["size"]
+                            shared["history"].append(
+                                self._ftp5_history_row(direction, fn, "Skipped", job["size"])
+                            )
+                        continue
+                    elif decision == "rename":
+                        if direction == "upload":
+                            stem, ext = os.path.splitext(rpath)
+                            rpath = f"{stem}_copy{ext}"
+                        else:
+                            stem, ext = os.path.splitext(lpath)
+                            lpath = f"{stem}_copy{ext}"
+
+                def _cb(nbytes, _fn=fn):
+                    if self.ftp5_cancel_flag or worker.is_cancelled:
+                        raise IOError("cancelled")
+                    with shared["lock"]:
+                        shared["sent"] += nbytes
+                        sent = shared["sent"]
+                        now = time.time()
+                        # Throttle progress signals to ~12 Hz across all workers
+                        if now - shared["last_progress_emit"] < 0.08 and sent < shared["total"]:
+                            return
+                        shared["last_progress_emit"] = now
+                    el = time.time() - shared["start"]
+                    spd = sent / max(0.001, el)
+                    eta = (shared["total"] - sent) / max(1, spd)
+                    pct = min(100.0, sent / shared["total"] * 100.0)
+                    signals.progress.emit(pct, spd, eta, _fn)
+
+                status = "Done"
+                checksum = None
+                try:
+                    if direction == "upload":
+                        signals.log.emit(f"[FTP] Uploading {fn} → {rpath}")
+                        with open(lpath, "rb") as f:
+                            ftp.storbinary(
+                                f"STOR {rpath}",
+                                f,
+                                blocksize=1024 * 512,
+                                callback=lambda data: _cb(len(data)),
+                            )
+                    else:
+                        signals.log.emit(f"[FTP] Downloading {fn}")
+                        os.makedirs(os.path.dirname(lpath) or ".", exist_ok=True)
+                        with open(lpath, "wb") as f:
+                            def writer(data, _f=f):
+                                _f.write(data)
+                                _cb(len(data))
+                            try:
+                                ftp.retrbinary(f"RETR {rpath}", writer, blocksize=1024 * 512)
+                            except Exception:
+                                parent = posixpath.dirname(rpath) or "/"
+                                ftp.cwd(parent)
+                                ftp.retrbinary(
+                                    f"RETR {posixpath.basename(rpath)}",
+                                    writer,
+                                    blocksize=1024 * 512,
+                                )
+
+                    if self.ftp5_verify_checksum:
+                        checksum = self._ftp5_file_md5(lpath)
+                        if checksum:
+                            signals.log.emit(f"[FTP] MD5 {fn}: {checksum}")
+                except Exception as e:
+                    if "cancelled" in str(e).lower() or self.ftp5_cancel_flag or worker.is_cancelled:
+                        signals.log.emit("[FTP] Transfer cancelled.")
+                        signals.item_update.emit(key, "Cancelled")
+                        break
+                    signals.log.emit(f"[ERROR] {fn}: {e}")
+                    status = "Failed"
+                    with shared["lock"]:
+                        shared["any_fail"] = True
+                    checksum = None
+
+                signals.item_update.emit(key, status)
+                with shared["lock"]:
+                    shared["history"].append(
+                        self._ftp5_history_row(
+                            direction, fn, status, job["size"],
+                            checksum=checksum, local=lpath, remote=rpath,
+                        )
+                    )
+        finally:
+            with self._ftp5_live_ftps_lock:
+                if ftp in self._ftp5_live_ftps:
+                    self._ftp5_live_ftps.remove(ftp)
+            safe_ftp_close(ftp)
+            worker.set_active_ftp(None)
         return True
 
     def _ftp5_history_row(self, direction, name, status, size, checksum=None, local=None, remote=None):
@@ -3902,7 +4206,7 @@ class NexusApp(QMainWindow):
         with shared["lock"]:
             shared["completed"] += 1
             done = shared["completed"] >= shared["worker_count"]
-        if not ok:
+        if not ok and msg and "cancel" not in str(msg).lower():
             self.log(f"[ERROR] Transfer connection failed: {msg}")
         if done:
             self._ftp5_finish_parallel_transfer(shared, direction)
@@ -4024,37 +4328,40 @@ class NexusApp(QMainWindow):
 
         def _expand_task(signals, worker):
             ftp = FTP()
-            ftp.connect(ip, int(port), timeout=15)
-            ftp.login()
-            try:
-                ftp.cwd(target_dir)
-            except Exception:
-                pass
+            worker.set_active_ftp(ftp)
             jobs = []
-            for name, is_dir in zip(names, is_dirs):
-                rpath = f"{target_dir.rstrip('/')}/{name}" if target_dir != "/" else f"/{name}"
-                lpath = os.path.join(dest, name)
-                if is_dir:
-                    jobs.append({"remote": rpath, "local": lpath, "size": 0, "is_dir": True})
-                    _walk_remote(ftp, rpath, lpath, jobs)
-                    try:
-                        ftp.cwd(target_dir)
-                    except Exception:
-                        pass
-                else:
-                    sz = 0
-                    try:
-                        sz = ftp.size(name) or 0
-                    except Exception:
+            try:
+                ftp.connect(ip, int(port), timeout=15)
+                ftp.login()
+                try:
+                    ftp.cwd(target_dir)
+                except Exception:
+                    pass
+                for name, is_dir in zip(names, is_dirs):
+                    if worker.is_cancelled:
+                        raise IOError("cancelled")
+                    rpath = remote_join(target_dir, name) if target_dir != "/" else remote_join("/", name)
+                    lpath = os.path.join(dest, name)
+                    if is_dir:
+                        jobs.append({"remote": rpath, "local": lpath, "size": 0, "is_dir": True})
+                        _walk_remote(ftp, rpath, lpath, jobs)
                         try:
-                            sz = ftp.size(rpath) or 0
+                            ftp.cwd(target_dir)
                         except Exception:
                             pass
-                    jobs.append({"remote": rpath, "local": lpath, "size": sz, "is_dir": False})
-            try:
-                ftp.quit()
-            except Exception:
-                pass
+                    else:
+                        sz = 0
+                        try:
+                            sz = ftp.size(name) or 0
+                        except Exception:
+                            try:
+                                sz = ftp.size(rpath) or 0
+                            except Exception:
+                                pass
+                        jobs.append({"remote": rpath, "local": lpath, "size": sz, "is_dir": False})
+            finally:
+                safe_ftp_close(ftp)
+                worker.set_active_ftp(None)
             return jobs
 
         def _on_expanded(ok, msg, jobs):
@@ -4088,7 +4395,7 @@ class NexusApp(QMainWindow):
         ip, port = self.current_ip, self.current_port
         target_dir = self.ftp5_rem_path_input.text().strip() or "/"
 
-        def _rm_tree(ftp, path):
+        def _rm_tree(ftp, path, signals):
             try:
                 ftp.cwd(path)
             except Exception:
@@ -4099,9 +4406,9 @@ class NexusApp(QMainWindow):
                 return
             entries = ftp_list_detailed(ftp, ".")
             for e in entries:
-                child = f"{path.rstrip('/')}/{e['name']}"
+                child = remote_join(path, e["name"])
                 if e["is_dir"]:
-                    _rm_tree(ftp, child)
+                    _rm_tree(ftp, child, signals)
                 else:
                     try:
                         ftp.delete(child)
@@ -4109,37 +4416,40 @@ class NexusApp(QMainWindow):
                         try:
                             ftp.delete(e["name"])
                         except Exception as ex:
-                            signals_ref[0].log.emit(f"[ERROR] delete {e['name']}: {ex}")
+                            signals.log.emit(f"[ERROR] delete {e['name']}: {ex}")
             try:
                 ftp.cwd("..")
-                ftp.rmd(path if path.startswith("/") else os.path.basename(path))
+                ftp.rmd(path if path.startswith("/") else posixpath.basename(path))
             except Exception:
                 try:
-                    ftp.rmd(os.path.basename(path))
+                    ftp.rmd(posixpath.basename(path))
                 except Exception:
                     pass
 
-        signals_ref = [None]
-
         def _task(signals, worker):
-            signals_ref[0] = signals
             ftp = FTP()
-            ftp.connect(ip, int(port), timeout=10)
-            ftp.login()
-            ftp.cwd(target_dir)
-            for name, is_dir in zip(names, is_dirs):
-                rpath = f"{target_dir.rstrip('/')}/{name}" if target_dir != "/" else f"/{name}"
-                if is_dir:
-                    _rm_tree(ftp, rpath)
-                else:
-                    try:
-                        ftp.delete(name)
-                    except Exception:
+            worker.set_active_ftp(ftp)
+            try:
+                ftp.connect(ip, int(port), timeout=10)
+                ftp.login()
+                ftp.cwd(target_dir)
+                for name, is_dir in zip(names, is_dirs):
+                    if worker.is_cancelled:
+                        break
+                    rpath = remote_join(target_dir, name) if target_dir != "/" else remote_join("/", name)
+                    if is_dir:
+                        _rm_tree(ftp, rpath, signals)
+                    else:
                         try:
-                            ftp.delete(rpath)
-                        except Exception as e:
-                            signals.log.emit(f"[ERROR] {e}")
-            ftp.quit()
+                            ftp.delete(name)
+                        except Exception:
+                            try:
+                                ftp.delete(rpath)
+                            except Exception as e:
+                                signals.log.emit(f"[ERROR] {e}")
+            finally:
+                safe_ftp_close(ftp)
+                worker.set_active_ftp(None)
             return True
 
         worker = BaseTaskWorker(_task)
@@ -4318,7 +4628,7 @@ class NexusApp(QMainWindow):
         
         layout.addWidget(card)
         
-        btn_start = QPushButton("Compress")
+        btn_start = QPushButton("▶ Compress Direct to FFPFSC")
         btn_start.setObjectName("Primary")
         btn_start.setMinimumHeight(34)
         btn_start.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
@@ -4437,7 +4747,7 @@ class NexusApp(QMainWindow):
         layout = QVBoxLayout(parent)
         layout.setContentsMargins(0, 0, 0, 0)
         
-        lbl = QLabel("🌐 Web Apps")
+        lbl = QLabel("🌐 Console Browser")
         lbl.setObjectName("Heading")
         layout.addWidget(lbl)
         
@@ -4528,7 +4838,7 @@ class NexusApp(QMainWindow):
             ".bm-btn:hover{background:#FF0033;border-color:#FF0033}"
             ".footer{margin-top:24px;font-size:11px;color:#665665}"
             "</style></head><body><div class='card'><h1>NEXUS</h1>"
-            "<p class='sub'>Welcome!<br>"
+            "<p class='sub'>Welcome to the Console Browser.<br>"
             "Pick a quick link below or type a URL in the address bar.</p>"
             f"<div class='bm-grid'>{buttons_html}</div>"
             "<p class='footer'>PS5 Utility Suite · Issu. 2026</p>"
